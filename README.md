@@ -1,9 +1,10 @@
-<img src="figs/logo.png" alt="EAGLE" width="220" align="left"><div align="center"><h1>&nbsp;SEAGLE</h1></div>
+<img src="figs/seagle-readme.png" alt="SEAGLE" width="220" align="left"><div align="center"><h1>&nbsp;SEAGLE</h1></div>
 
 <p align="center">
 | <a href="https://arxiv.org/pdf/2401.15077.pdf"><b>Paper (EAGLE)</b></a> | 
 <a href="https://arxiv.org/pdf/2406.16858"><b>Paper (EAGLE-2)</b></a> |
 <a href="https://arxiv.org/pdf/2503.01840"><b>Paper (EAGLE-3)</b></a> |
+<a href="https://arxiv.org/pdf/2309.17453"><b>Paper (StreamingLLM)</b></a> |
 <a href="https://sites.google.com/view/
 eagle-llm"><b>Blog</b></a> |
 </p>
@@ -28,13 +29,47 @@ eagle-llm"><b>Blog</b></a> |
 
 ##
 
-## Additions
+### The context size limitation
 
-### New Speculative Decoding Method
+Despite EAGLE-3's impressive performance gains, it faces a critical limitation when dealing with long contexts: an important acceptance rate degradation.
 
-Based on the existing EAGLE-3 (from which this repository is forked) and StreamingLLM methods, we propose a new speculative decoding algorithm that is scalable to large context sizes.
+With contexts which exceed the max context size of EAGLE-3, there is a dramatically reduced acceptance length, leading to more rejections (see illustration below). Past a point, the overhead of running the Draft model exceeds the savings from accepted tokens, making this method counterproductive and potentially decreasing inference speed.
 
-### (Old README)
+<p align="center">
+  <img src="./figs/eagle3_size_limitation.png" alt="acceptance rate" width="790">
+</p>
+
+### Introducing hybrid StreamingLLM and EAGLE-3 method
+
+Our approach combines EAGLE-3's speculative decoding efficiency with StreamingLLM's unlimited context capabilities, resulting in a speculative decoding system that is both fast and scalable.
+
+One of the limitations of StreamingLLM is the lack of knowledge retention once the context length exceeds the window size, which limits its application on LLMs. However, by using StreamingLLM only on the Draft model, we can work around this limitation, since the verification is done with the Target model on the full context.
+
+### Results
+
+<p align="center">
+  <img src="./figs/seagle_results.png" alt="results" width="790">
+Result on the same summarize task we tested EAGLE-3 / Llama3-8b
+</p>
+
+
+On summarization tasks with Llama-3-8B, SEAGLE maintains the same mean acceptance length as EAGLE-3 for short contexts (<2,048 tokens), but also remains stable up to 10K tokens with a mean acceptance length around 2.4. EAGLE-3’s performance, by comparison, quickly degrades beyond 2K tokens with a mean acceptance length between 0.69 and 0.37 for context size between 3,000 and 10,000 tokens, roughly 4x lower than SEAGLE.
+
+### Main changes vs original repository
+
+Change to the [cnets.py](eagle/model/cnets.py) file to enable Seagle.
+- changing the position encoding, to be able to compute it separately for the query and the key.
+- changing the attention mechanism to conform to StreamingLLM's attention mechanism.
+(with some adaptation for the positions ids, due to the tree structure of EAGLE-3)
+- adding a chunked_attention computation, to be able to compute the attention in chunks to avoid memory issues.
+
+Adding a [attention_sink_kv_cache.py](eagle/model/attention_sinks_kvcache.py) file to with the implementation of the attention sink mechanism of StreamingLLM.
+
+Minor change to [eagle_model.py](eagle/model/eagle_model.py) to add a better logging of the results.
+
+Adding a [test_setup.py](test_setup.py) file to test the performance of Seagle on a summarization task.
+
+## (Old README)
 
 <p align="center">
   <img src="./figs/eagle3r.jpg" alt="benchmark" width="790">
