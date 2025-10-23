@@ -1,4 +1,4 @@
-<img src="figs/logo.png" alt="EAGLE" width="220" align="left"><div align="center"><h1>&nbsp;EAGLE</h1></div>
+<img src="figs/logo.png" alt="EAGLE" width="220" align="left"><div align="center"><h1>&nbsp;SEAGLE</h1></div>
 
 <p align="center">
 | <a href="https://arxiv.org/pdf/2401.15077.pdf"><b>Paper (EAGLE)</b></a> | 
@@ -24,9 +24,17 @@ eagle-llm"><b>Blog</b></a> |
   </a>
 </p>
 
-> **Note:** This repository is forked from [@SafeAILab/EAGLE](https://github.com/SafeAILab/EAGLE)
+**Note:** This repository is forked from [@SafeAILab/EAGLE](https://github.com/SafeAILab/EAGLE) (old README below)
 
 ##
+
+## Additions
+
+### New Speculative Decoding Method
+
+Based on the existing EAGLE-3 (from which this repository is forked) and StreamingLLM methods, we propose a new speculative decoding algorithm that is scalable to large context sizes.
+
+### (Old README)
 
 <p align="center">
   <img src="./figs/eagle3r.jpg" alt="benchmark" width="790">
