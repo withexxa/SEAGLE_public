@@ -30,7 +30,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 from huggingface_hub import hf_hub_download
 
-
+from .attention_sinks_kvcache import AttentionSinkKVCache
 try:
     from .configs import EConfig
     from .utils_c import *
@@ -42,6 +42,12 @@ except:
     from utils import prepare_logits_processor
 
 
+# Seagle: Set to True to enable Seagle
+ENABLE_SEAGLE = True
+# Attention Sink Size (cf Streaming-LLM paper)
+ATTENTION_SINK_SIZE = 4
+# Window Size (recommended window is 2048 (eagle training window size) - 10 (topK number of tokens))
+ATTENTION_WINDOW_SIZE = 2048 - 10
 
 
 # Copied from transformers.models.bart.modeling_bart._make_causal_mask
@@ -95,6 +101,14 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2:]
     return torch.cat((-x2, x1), dim=-1)
 
+def apply_rotary_pos_emb_single(x, cos, sin, position_ids):
+    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
+    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
+    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
+    selected_cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    selected_sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
+    x_embed = (x * selected_cos) + (rotate_half(x) * selected_sin)
+    return x_embed
 
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
@@ -247,6 +261,9 @@ class LlamaAttention(nn.Module):
             output_attentions: bool = False,
             use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        # If we are in the tree attention, positions ids are the same value several times (e.g. 10 times)
+        is_in_tree = position_ids.shape[1] > 1 and (position_ids[0,0] == position_ids[0,-1])
+
         bsz, q_len, _ = hidden_states.size()
 
         if self.config.pretraining_tp > 1:
@@ -278,8 +295,14 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
+
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
+        # Streaming LLM Position shift: Separate the positional embedding for query and key, with shift positionning for keys
+        if ENABLE_SEAGLE:
+            query_states = apply_rotary_pos_emb_single(query_states, cos, sin, position_ids)
+        else:
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
             # reuse k, v, self_attention
@@ -288,28 +311,30 @@ class LlamaAttention(nn.Module):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
+        # Streaming LLM Position shift: Key position ids are the pos in cache
+        if ENABLE_SEAGLE:
+            key_position_ids = torch.arange(kv_seq_len, device=position_ids.device).unsqueeze(0)
+
+            if is_in_tree:
+                #TODO: explain that properly
+                tree_iteration = (kv_seq_len - position_ids[0,0]) // (position_ids.shape[1] - 1)
+                key_position_ids = key_position_ids[:, :-tree_iteration*(position_ids.shape[1])]
+                for i in range(tree_iteration):
+                    speculative_position_id = position_ids[0,0] - tree_iteration + i + 1
+                    key_position_ids = torch.cat([key_position_ids, torch.ones_like(position_ids) * speculative_position_id], dim=1)
+                pass
+
+            key_states = apply_rotary_pos_emb_single(key_states, cos, sin, key_position_ids)
+
         # repeat k/v heads if n_kv_heads < n_heads
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Memory-efficient chunked attention implementation
+        attn_output = self._chunked_attention(
+            query_states, key_states, value_states, attention_mask,
+            bsz, q_len, kv_seq_len, chunk_size=512
+        )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -331,6 +356,78 @@ class LlamaAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+
+    def _chunked_attention(self, query_states, key_states, value_states, attention_mask,
+                          bsz, q_len, kv_seq_len, chunk_size=512):
+        """
+        Memory-efficient chunked attention computation with correct softmax normalization.
+        Uses online softmax algorithm to maintain mathematical equivalence with standard attention.
+
+        Args:
+            query_states: [bsz, num_heads, q_len, head_dim]
+            key_states: [bsz, num_heads, kv_seq_len, head_dim]
+            value_states: [bsz, num_heads, kv_seq_len, head_dim]
+            attention_mask: [bsz, 1, q_len, kv_seq_len] or None
+            chunk_size: Size of chunks to process (default: 512)
+
+        Returns:
+            attn_output: [bsz, num_heads, q_len, head_dim]
+        """
+        head_dim = query_states.shape[-1]
+        scale = 1.0 / math.sqrt(head_dim)
+
+        # Initialize output and online softmax statistics
+        attn_output = torch.zeros_like(query_states)
+        max_scores = torch.full((bsz, self.num_heads, q_len, 1),
+                               float('-inf'), device=query_states.device, dtype=torch.float32)
+        sum_exp = torch.zeros((bsz, self.num_heads, q_len, 1),
+                             device=query_states.device, dtype=torch.float32)
+
+        # Process in chunks along the key/value sequence dimension
+        for start_idx in range(0, kv_seq_len, chunk_size):
+            end_idx = min(start_idx + chunk_size, kv_seq_len)
+
+            # Get chunks of keys and values
+            key_chunk = key_states[:, :, start_idx:end_idx, :]  # [bsz, num_heads, chunk_len, head_dim]
+            value_chunk = value_states[:, :, start_idx:end_idx, :]  # [bsz, num_heads, chunk_len, head_dim]
+
+            # Compute attention scores for this chunk
+            attn_chunk = torch.matmul(query_states, key_chunk.transpose(2, 3)) * scale
+
+            # Apply attention mask if provided
+            if attention_mask is not None:
+                mask_chunk = attention_mask[:, :, :, start_idx:end_idx]
+                attn_chunk = attn_chunk + mask_chunk
+
+            # Online softmax: update global max and sum (use fp32 for numerical stability)
+            chunk_max = torch.max(attn_chunk, dim=-1, keepdim=True)[0].to(torch.float32)
+
+            # Update global maximum
+            new_max = torch.maximum(max_scores, chunk_max)
+
+            # Rescale previous sum_exp and output based on new max
+            exp_diff_old = torch.exp(max_scores - new_max)
+
+            # Update sum_exp with numerical stability
+            sum_exp = sum_exp * exp_diff_old + torch.sum(torch.exp(attn_chunk.to(torch.float32) - new_max), dim=-1, keepdim=True)
+
+            # Rescale previous output (convert to fp32 for computation, then back)
+            attn_output = attn_output * exp_diff_old.to(query_states.dtype)
+
+            # Add contribution from current chunk
+            # Compute properly normalized attention weights for this chunk
+            attn_weights_chunk = torch.exp(attn_chunk.to(torch.float32) - new_max).to(query_states.dtype)
+            attn_output_chunk = torch.matmul(attn_weights_chunk, value_chunk)
+            attn_output = attn_output + attn_output_chunk
+
+            # Update max_scores
+            max_scores = new_max
+
+        # Final normalization (convert sum_exp to match output dtype)
+        attn_output = attn_output / sum_exp.to(query_states.dtype)
+
+        return attn_output
 
 
 class LlamaMLP(nn.Module):
@@ -427,6 +524,10 @@ class LlamaDecoderLayeremb(nn.Module):
         hidden_states = self.hidden_norm(hidden_states)
         input_emb = self.input_layernorm(input_emb)
 
+        if input_emb.shape[1] != hidden_states.shape[1]:
+            print(f"input_emb.shape: {input_emb.shape}")
+            print(f"hidden_states.shape: {hidden_states.shape}")
+
         hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
 
 
@@ -478,6 +579,8 @@ def len_list(x, n):
 class Model(nn.Module):
     def __init__(self, config, load_emb=False, path=None, bias=True, total_tokens=63, depth=5, top_k=8, threshold=1.0):
         super().__init__()
+        self.attention_sink_kv_cache = AttentionSinkKVCache(ATTENTION_SINK_SIZE, ATTENTION_WINDOW_SIZE)
+
         self.config=config
         self.gradient_checkpointing = True
         self.padding_idx = config.pad_token_id
@@ -670,6 +773,7 @@ class Model(nn.Module):
     def topK_genrate(self, hidden_states, input_ids, head, logits_processor):
 
         input_ids = input_ids.to(hidden_states.device)
+
         total_tokens = self.total_tokens
         depth = self.depth
         top_k = self.top_k
@@ -686,13 +790,28 @@ class Model(nn.Module):
         len_posi = input_ids.shape[1]
         self.reset()
 
+
         # with Timer("draft many"):
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
-            kv_len = self.stable_kv[0][0].shape[2]
-            out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+            # Streaming LLM: We can't use the kv len to cut as it is being modified by the attention sink and rolling window
+            # So we use the hidden states length to cut the input_ids
+            # TODO: This seems like a dirty fix, it works on the dimension level but not sure about the correctness
+            if ENABLE_SEAGLE:
+                hidden_states_len = hidden_states.shape[1]
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, -hidden_states_len:],
                                                past_key_values=self.stable_kv, use_cache=True)
+            else:
+                kv_len = self.stable_kv[0][0].shape[2]
+                out_hidden, past_key_values = self(hidden_states, input_ids=input_ids[:, kv_len:],
+                                                past_key_values=self.stable_kv, use_cache=True)
         else:
             out_hidden, past_key_values = self(hidden_states, input_ids=input_ids, use_cache=True)
+
+        # Streaming LLM: Implement attention Sink and slicing there
+        if ENABLE_SEAGLE:
+            past_key_values = self.attention_sink_kv_cache(past_key_values)
+            len_posi = past_key_values[0][0].shape[2]
+
         self.stable_kv = past_key_values
         last_hidden = out_hidden[:, -1]
 
@@ -718,10 +837,12 @@ class Model(nn.Module):
         # 4
         for i in range(depth):
             self.tree_mask = tree_mask
+
             position_ids = len_posi + self.position_ids
             # with Timer("draft one"):
             out_hidden, past_key_values = self(input_hidden, input_ids=input_ids, past_key_values=past_key_values,
                                                position_ids=position_ids, use_cache=True)
+
             len_posi += 1
 
             # with Timer("sort1"):

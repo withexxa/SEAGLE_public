@@ -47,10 +47,8 @@ class EaModel(nn.Module):
         config = EConfig.from_pretrained(ea_model_path)
         with open(ea_model_path, "r") as f:
             con = json.loads(f.read())
-        try:
-            bias = con["bias"]
-        except:
-            bias = True
+        bias = con["bias"] if "bias" in con else True
+
         if use_eagle3:
             self.ea_layer = Model(config, bias=bias, total_tokens=total_token, depth=depth, top_k=top_k,
                                   threshold=threshold, path=base_model_name_or_path,load_emb=True)
@@ -198,11 +196,12 @@ class EaModel(nn.Module):
             top_p=0.0,
             top_k=0.0,
             max_new_tokens=512,
-            max_length=2048,
+            max_length=10000,
             log=False,
             is_llama3=False,
 
     ):
+        accept_lengths = []
         if is_llama3:
             stop_token_id = self.tokenizer.convert_tokens_to_ids("<|eot_id|>")
 
@@ -265,6 +264,9 @@ class EaModel(nn.Module):
             best_candidate, accept_length, sample_p = evaluate_posterior(
                 logits, candidates, logits_processor
             )
+
+            accept_lengths.append((int(input_ids.shape[1]), int(accept_length)))
+
             # print(accept_length)
             # Adjusting the input sequence, draft model forward
             input_ids, draft_tokens, retrieve_indices, tree_mask, tree_position_ids, new_token, hidden_state, sample_token = update_inference_inputs(
@@ -295,7 +297,7 @@ class EaModel(nn.Module):
         if not log:
             return input_ids
         else:
-            return input_ids, new_token, idx
+            return input_ids, accept_lengths
 
     @torch.no_grad()
     def naivegenerate(
@@ -305,7 +307,7 @@ class EaModel(nn.Module):
             top_p=0.0,
             top_k=0.0,
             max_new_tokens=512,
-            max_length=2048,
+            max_length=10000,
             log=False,
             is_llama3=False,
 
@@ -382,7 +384,7 @@ class EaModel(nn.Module):
             top_p=0.0,
             top_k=0.0,
             max_new_tokens=512,
-            max_length=2048,
+            max_length=10000,
             log=False,
             is_llama3=False,
 
@@ -485,7 +487,7 @@ class EaModel(nn.Module):
             top_p=0.0,
             top_k=0.0,
             max_new_tokens=512,
-            max_length=2048,
+            max_length=10000,
             log=False,
             is_llama3=False,
 

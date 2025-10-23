@@ -24,6 +24,7 @@ eagle-llm"><b>Blog</b></a> |
   </a>
 </p>
 
+> **Note:** This repository is forked from [@SafeAILab/EAGLE](https://github.com/SafeAILab/EAGLE)
 
 ##
 

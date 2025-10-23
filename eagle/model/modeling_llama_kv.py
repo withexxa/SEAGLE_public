@@ -612,6 +612,7 @@ class LlamaAttention(nn.Module):
         else:
             try:
                 scaling_type = self.config.rope_scaling["type"]
+
                 scaling_factor = self.config.rope_scaling["factor"]
                 if scaling_type == "linear":
                     self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
@@ -631,6 +632,7 @@ class LlamaAttention(nn.Module):
                     raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
             except:
                 # print("For LLaMA 31")
+                # raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
                 self.rotary_emb = LlamaRotaryEmbedding_L31(config=self.config)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -719,28 +721,11 @@ class LlamaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(
-            query_states, key_states.transpose(2, 3)
-        ) / math.sqrt(self.head_dim)
-
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
-                f" {attn_weights.size()}"
-            )
-
-        if attention_mask is not None:
-            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-                raise ValueError(
-                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-                )
-            attn_weights = attn_weights + attention_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Memory-efficient chunked attention implementation
+        attn_output = self._chunked_attention(
+            query_states, key_states, value_states, attention_mask,
+            bsz, q_len, kv_seq_len, chunk_size=512
+        )
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -771,6 +756,77 @@ class LlamaAttention(nn.Module):
             attn_weights = None
 
         return attn_output, attn_weights, past_key_value
+
+    def _chunked_attention(self, query_states, key_states, value_states, attention_mask,
+                          bsz, q_len, kv_seq_len, chunk_size=512):
+        """
+        Memory-efficient chunked attention computation with correct softmax normalization.
+        Uses online softmax algorithm to maintain mathematical equivalence with standard attention.
+
+        Args:
+            query_states: [bsz, num_heads, q_len, head_dim]
+            key_states: [bsz, num_heads, kv_seq_len, head_dim]
+            value_states: [bsz, num_heads, kv_seq_len, head_dim]
+            attention_mask: [bsz, 1, q_len, kv_seq_len] or None
+            chunk_size: Size of chunks to process (default: 512)
+
+        Returns:
+            attn_output: [bsz, num_heads, q_len, head_dim]
+        """
+        head_dim = query_states.shape[-1]
+        scale = 1.0 / math.sqrt(head_dim)
+
+        # Initialize output and online softmax statistics
+        attn_output = torch.zeros_like(query_states)
+        max_scores = torch.full((bsz, self.num_heads, q_len, 1),
+                               float('-inf'), device=query_states.device, dtype=torch.float32)
+        sum_exp = torch.zeros((bsz, self.num_heads, q_len, 1),
+                             device=query_states.device, dtype=torch.float32)
+
+        # Process in chunks along the key/value sequence dimension
+        for start_idx in range(0, kv_seq_len, chunk_size):
+            end_idx = min(start_idx + chunk_size, kv_seq_len)
+
+            # Get chunks of keys and values
+            key_chunk = key_states[:, :, start_idx:end_idx, :]  # [bsz, num_heads, chunk_len, head_dim]
+            value_chunk = value_states[:, :, start_idx:end_idx, :]  # [bsz, num_heads, chunk_len, head_dim]
+
+            # Compute attention scores for this chunk
+            attn_chunk = torch.matmul(query_states, key_chunk.transpose(2, 3)) * scale
+
+            # Apply attention mask if provided
+            if attention_mask is not None:
+                mask_chunk = attention_mask[:, :, :, start_idx:end_idx]
+                attn_chunk = attn_chunk + mask_chunk
+
+            # Online softmax: update global max and sum (use fp32 for numerical stability)
+            chunk_max = torch.max(attn_chunk, dim=-1, keepdim=True)[0].to(torch.float32)
+
+            # Update global maximum
+            new_max = torch.maximum(max_scores, chunk_max)
+
+            # Rescale previous sum_exp and output based on new max
+            exp_diff_old = torch.exp(max_scores - new_max)
+
+            # Update sum_exp with numerical stability
+            sum_exp = sum_exp * exp_diff_old + torch.sum(torch.exp(attn_chunk.to(torch.float32) - new_max), dim=-1, keepdim=True)
+
+            # Rescale previous output (convert to fp32 for computation, then back)
+            attn_output = attn_output * exp_diff_old.to(query_states.dtype)
+
+            # Add contribution from current chunk
+            # Compute properly normalized attention weights for this chunk
+            attn_weights_chunk = torch.exp(attn_chunk.to(torch.float32) - new_max).to(query_states.dtype)
+            attn_output_chunk = torch.matmul(attn_weights_chunk, value_chunk)
+            attn_output = attn_output + attn_output_chunk
+
+            # Update max_scores
+            max_scores = new_max
+
+        # Final normalization (convert sum_exp to match output dtype)
+        attn_output = attn_output / sum_exp.to(query_states.dtype)
+
+        return attn_output
 
 
 class LlamaDecoderLayer(nn.Module):
