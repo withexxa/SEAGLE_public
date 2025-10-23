@@ -39,6 +39,9 @@ With contexts which exceed the max context size of EAGLE-3, there is a dramatica
   <img src="./figs/eagle3_size_limitation.png" alt="acceptance rate" width="790">
 </p>
 
+The summarization task we used for our different tests was to summarize in a single paragraph different parts "of the book “Lost illusions”, by Honoré de Balzac, in its English edition. This test was done with a Llama-3-8B model.
+
+
 ### Introducing hybrid StreamingLLM and EAGLE-3 method
 
 Our approach combines EAGLE-3's speculative decoding efficiency with StreamingLLM's unlimited context capabilities, resulting in a speculative decoding system that is both fast and scalable.
