@@ -42,17 +42,18 @@ With contexts which exceed the max context size of EAGLE-3, there is a dramatica
 The summarization task we used for our different tests was to summarize in a single paragraph different parts "of the book “Lost illusions”, by Honoré de Balzac, in its English edition. This test was done with a Llama-3-8B model.
 
 
-### Introducing hybrid StreamingLLM and EAGLE-3 method
+### Leverage StreamingLLM to overcome EAGLE-3 context limitations
 
-Our approach combines EAGLE-3's speculative decoding efficiency with StreamingLLM's unlimited context capabilities, resulting in a speculative decoding system that is both fast and scalable.
+Our approach combines EAGLE-3's speculative decoding efficiency with Streaming-LLM's unlimited context capabilities, resulting in a speculative decoding system that is both fast and scalable. This solves the performance degradation problem of EAGLE-3 over long contexts.
 
-One of the limitations of StreamingLLM is the lack of knowledge retention once the context length exceeds the window size, which limits its application on LLMs. However, by using StreamingLLM only on the Draft model, we can work around this limitation, since the verification is done with the Target model on the full context.
+By using StreamingLLM only on the Draft model, we are also not impacted by its knowledge retention limitation since the verification is done with the Target model on the full context.
+
 
 ### Results
 
 <p align="center">
   <img src="./figs/seagle_results.png" alt="results" width="790">
-Result on the same summarize task we tested EAGLE-3 / Llama3-8b
+Result on the same summarize task we tested EAGLE-3 / Llama-3-8b
 </p>
 
 
